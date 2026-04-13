@@ -71,8 +71,9 @@ encoding (`OrderId`) is persisted.
 | `expiry`        | `u64`       | Unix timestamp in milliseconds. Order must not execute after this time. |
 | `fee_rate`      | `Perbill`   | Per-order fee as a fraction of the input amount. `Perbill::zero()` = no fee. |
 | `fee_recipient` | `AccountId` | Account that receives the fee collected for this order. |
-| `relayer`       | `Option<AccountId>` | If `Some`, restricts execution to a single designated relayer account. Any attempt by a different account to execute this order is rejected with `RelayerMissMatch`. `None` = any relayer may execute. |
-| `max_slippage`  | `Option<Perbill>`   | Maximum acceptable slippage in parts per billion applied to `limit_price` at swap time. `None` = no slippage protection (execute at market). When `Some(p)`: Buy ceiling = `limit_price + limit_price * p`; Sell floor = `limit_price - limit_price * p`. Both saturate at `u64` bounds. |
+| `relayer`               | `Option<AccountId>` | If `Some`, restricts execution to a single designated relayer account. Any attempt by a different account to execute this order is rejected with `RelayerMissMatch`. `None` = any relayer may execute. Required when `partial_fills_enabled` is `true`. |
+| `max_slippage`          | `Option<Perbill>`   | Maximum acceptable slippage in parts per billion applied to `limit_price` at swap time. `None` = no slippage protection (execute at market). When `Some(p)`: Buy ceiling = `limit_price + limit_price * p`; Sell floor = `limit_price - limit_price * p`. Both saturate at `u64` bounds. |
+| `partial_fills_enabled` | `bool`              | If `true`, the relayer may submit `SignedOrder.partial_fill` to execute only a fraction of `amount` per call. Requires `relayer` to be `Some`. |
 
 ### `OrderType`
 
@@ -89,14 +90,22 @@ sr25519 signature over the SCALE encoding of the `VersionedOrder` (including the
 version discriminant). Only sr25519 signatures are accepted. Signature
 verification uses the inner `order.signer` as the expected public key.
 
+| Field          | Type                       | Description |
+|----------------|----------------------------|-------------|
+| `order`        | `VersionedOrder<AccountId>`| The signed order payload. |
+| `signature`    | `MultiSignature`           | Sr25519 signature over `SCALE_ENCODE(order)`. |
+| `partial_fill` | `Option<u64>`              | If `Some(n)`, execute only `n` units of `order.amount` this call. Requires `order.partial_fills_enabled = true` and `order.relayer = Some(...)`. `n` must be > 0 and ≤ remaining unfilled amount. |
+
 ### `OrderStatus`
 
-Terminal state of a processed order, stored under its `OrderId`.
+State of a known order, stored under its `OrderId`. Absence means the order has
+never been seen and is still executable.
 
-| Variant     | Meaning |
-|-------------|---------|
-| `Fulfilled` | Order was successfully executed. |
-| `Cancelled` | User registered a cancellation intent before execution. |
+| Variant                | Meaning |
+|------------------------|---------|
+| `Fulfilled`            | Order was fully executed. Terminal — cannot be re-executed. |
+| `PartiallyFilled(u64)` | Order has been partially executed; the `u64` is the cumulative filled amount so far. Not terminal — further partial fills are allowed until the total reaches `order.amount`. |
+| `Cancelled`            | User registered a cancellation intent before full execution. Terminal — cannot be re-executed. |
 
 ---
 
@@ -105,9 +114,10 @@ Terminal state of a processed order, stored under its `OrderId`.
 ### `Orders: StorageMap<H256, OrderStatus>`
 
 Maps an `OrderId` (blake2_256 of the SCALE-encoded `VersionedOrder`) to its
-terminal `OrderStatus`. Absence means the order has never been seen and is still
-executable (provided it is valid). Presence means it is permanently closed —
-neither `Fulfilled` nor `Cancelled` orders can be re-executed.
+`OrderStatus`. Absence means the order has never been seen and is still
+executable. `Fulfilled` and `Cancelled` are terminal — neither can be
+re-executed. `PartiallyFilled(n)` is non-terminal — further partial fills are
+allowed until the cumulative filled amount reaches `order.amount`.
 
 ---
 
@@ -208,10 +218,12 @@ Registers a cancellation intent by writing the `OrderId` into `Orders` as
 
 | Event | Fields | Emitted when |
 |-------|--------|--------------|
-| `OrderExecuted` | `order_id`, `signer`, `netuid`, `side` | An individual order was successfully executed (by either extrinsic). |
+| `OrderExecuted` | `order_id`, `signer`, `netuid`, `order_type`, `amount_in`, `amount_out` | An order was successfully executed (fully or as a partial fill). `amount_in` is TAO for buys, alpha for sells. `amount_out` is alpha for buys, net TAO (after fee) for sells. Emitted by both extrinsics. |
 | `OrderSkipped` | `order_id`, `reason` | An order was skipped by `execute_orders` (bad signature, expired, wrong netuid, already processed, price condition not met, or root netuid). `reason` is the `DispatchError` that caused the skip. Not emitted by `execute_batched_orders` — invalid orders there cause the whole call to fail. |
 | `OrderCancelled` | `order_id`, `signer` | The signer registered a cancellation via `cancel_order`. |
 | `GroupExecutionSummary` | `netuid`, `net_side`, `net_amount`, `actual_out`, `executed_count` | Emitted once per `execute_batched_orders` call summarising the net pool trade. `net_side` is `Buy` if TAO was sent to the pool, `Sell` if alpha was sent. `net_amount` and `actual_out` are zero when the two sides perfectly offset. |
+| `FeeTransferFailed` | `recipient`, `amount`, `reason` | A fee transfer to a `fee_recipient` failed. The fee TAO remains with the sender. Emitted best-effort — does not revert the surrounding order or batch. |
+| `LimitOrdersPalletStatusChanged` | `enabled` | Root enabled or disabled the pallet via `set_limit_orders_enabled`. |
 
 ---
 
@@ -219,15 +231,20 @@ Registers a cancellation intent by writing the `OrderId` into `Orders` as
 
 | Error | Cause |
 |-------|-------|
-| `InvalidSignature` | Signature does not match the order payload and signer. Also used as a catch-all for failed validation in `execute_orders`. |
-| `OrderAlreadyProcessed` | The `OrderId` is already present in `Orders` (either `Fulfilled` or `Cancelled`). |
-| `OrderExpired` | `now > order.expiry`. Only returned as a hard error by `execute_batched_orders`; silently skipped in `execute_orders`. |
-| `PriceConditionNotMet` | Current spot price is beyond the order's `limit_price`. Only returned as a hard error by `execute_batched_orders`; silently skipped in `execute_orders`. |
-| `OrderNetUidMismatch` | An order inside a `execute_batched_orders` call targets a different netuid than the batch parameter. |
-| `RootNetUidNotAllowed` | The order or batch targets netuid 0 (root). Root uses a fixed 1:1 stable mechanism with no AMM — limit orders are not meaningful there. |
+| `InvalidSignature` | Signature does not match the order payload and signer. |
+| `OrderAlreadyProcessed` | The `OrderId` is already in `Orders` as `Fulfilled` or `PartiallyFilled` at full amount. |
+| `OrderCancelled` | The `OrderId` is already in `Orders` as `Cancelled`. |
+| `OrderExpired` | `now > order.expiry`. Hard error in `execute_batched_orders`; silently skipped in `execute_orders`. |
+| `PriceConditionNotMet` | Current spot price is beyond the order's `limit_price`. Hard error in `execute_batched_orders`; silently skipped in `execute_orders`. |
+| `OrderNetUidMismatch` | An order in `execute_batched_orders` targets a different netuid than the batch parameter. |
+| `RootNetUidNotAllowed` | The order or batch targets netuid 0 (root). Root uses a fixed 1:1 stable mechanism — limit orders are not meaningful there. |
 | `Unauthorized` | Caller of `cancel_order` is not the order's `signer`. |
 | `SwapReturnedZero` | The pool swap returned zero output for a non-zero residual input. |
-| `RelayerMissMatch` | The caller is not the relayer designated in the order's `relayer` field. Only raised when the field is `Some`. |
+| `RelayerMissMatch` | The caller is not the relayer designated in `order.relayer`. Only raised when the field is `Some`. |
+| `LimitOrdersDisabled` | The pallet has been disabled by root via `set_limit_orders_enabled(false)`. |
+| `PartialFillsNotEnabled` | `SignedOrder.partial_fill` is `Some` but `order.partial_fills_enabled` is `false`. |
+| `IncorrectPartialFillAmount` | The requested partial fill amount is zero or exceeds the remaining unfilled amount. |
+| `RelayerRequiredForPartialFill` | `partial_fills_enabled` is `true` but `order.relayer` is `None`. |
 
 ---
 
@@ -250,6 +267,25 @@ upcasts to u128 internally to avoid overflow).
 At the end of each batch, fees are accumulated per unique `fee_recipient` and
 forwarded in a single transfer per recipient. If multiple orders share the same
 `fee_recipient`, they result in exactly one transfer rather than one per order.
+
+---
+
+## Partial fills
+
+An order can be executed incrementally across multiple calls instead of all at once.
+
+**Requirements:**
+- `order.partial_fills_enabled = true`
+- `order.relayer = Some(relayer_account)` — a designated relayer is required so only one party controls fill pacing
+- `SignedOrder.partial_fill = Some(n)` where `n > 0` and `n ≤ remaining unfilled amount`
+
+**Mechanics:**
+- Each partial execution writes `OrderStatus::PartiallyFilled(cumulative_filled)` to `Orders`.
+- When `cumulative_filled >= order.amount`, status transitions to `Fulfilled`.
+- The `amount_in` and `amount_out` fields of the emitted `OrderExecuted` event reflect only the portion filled in that call, not the total.
+- Fees are applied to the partial amount on each call.
+
+**Not supported in `execute_batched_orders`** — partial fills are only available via `execute_orders`.
 
 ---
 

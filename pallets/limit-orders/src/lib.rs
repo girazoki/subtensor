@@ -1,4 +1,5 @@
 #![cfg_attr(not(feature = "std"), no_std)]
+#![allow(clippy::too_many_arguments)]
 
 pub use pallet::*;
 
@@ -59,7 +60,8 @@ impl OrderType {
 /// The canonical order payload that users sign off-chain.
 /// Only its H256 hash is stored on-chain; the full struct is submitted by the
 /// admin at execution time (or by the user at cancellation time).
-#[freeze_struct("e64b59c23fbce993")]
+#[allow(clippy::multiple_bound_locations)] // bounds on AccountId required by FRAME derives
+#[freeze_struct("67f79940b264f48")]
 #[derive(
     Encode, Decode, DecodeWithMemTracking, TypeInfo, MaxEncodedLen, Clone, PartialEq, Eq, Debug,
 )]
@@ -184,6 +186,7 @@ pub(crate) struct OrderEntry<AccountId> {
 // ── Pallet ───────────────────────────────────────────────────────────────────
 
 #[frame_support::pallet]
+#[allow(clippy::expect_used)]
 pub mod pallet {
     use super::*;
     use crate::weights::WeightInfo as _;
@@ -473,7 +476,7 @@ pub mod pallet {
                     }
                 }
                 Some(slippage) => {
-                    let delta = slippage * limit_price;
+                    let delta = slippage.mul_floor(limit_price);
                     if is_buy {
                         limit_price.saturating_add(delta)
                     } else {
@@ -628,7 +631,7 @@ pub mod pallet {
                 // partial fill validations have passed, it is safe here to do this
                 let tao_in = TaoBalance::from(signed_order.partial_fill.unwrap_or(order.amount));
                 // Deduct fee from TAO input before swapping.
-                let fee_tao = TaoBalance::from(order.fee_rate * tao_in.to_u64());
+                let fee_tao = TaoBalance::from(order.fee_rate.mul_ceil(tao_in.to_u64()));
                 let tao_after_fee = tao_in.saturating_sub(fee_tao);
 
                 let alpha_out = T::SwapInterface::buy_alpha(
@@ -659,7 +662,7 @@ pub mod pallet {
                 )?;
 
                 // Deduct fee from TAO output and forward to the order's fee recipient.
-                let fee_tao = TaoBalance::from(order.fee_rate * tao_out.to_u64());
+                let fee_tao = TaoBalance::from(order.fee_rate.mul_ceil(tao_out.to_u64()));
                 Self::forward_fee(&order.signer, &order.fee_recipient, fee_tao);
                 (alpha_in.to_u64(), tao_out.saturating_sub(fee_tao).to_u64())
             };
@@ -695,7 +698,7 @@ pub mod pallet {
             let (valid_buys, valid_sells) =
                 Self::validate_and_classify(netuid, &orders, now_ms, current_price, relayer)?;
 
-            let executed_count = (valid_buys.len() + valid_sells.len()) as u32;
+            let executed_count = valid_buys.len().saturating_add(valid_sells.len()) as u32;
             if executed_count == 0 {
                 return Ok(());
             }
@@ -826,7 +829,7 @@ pub mod pallet {
                 let amount_in = signed_order.partial_fill.unwrap_or(order.amount);
                 let net = if order.order_type.is_buy() {
                     // Buy: fee on TAO input — net is the amount that reaches the pool.
-                    amount_in.saturating_sub(order.fee_rate * amount_in)
+                    amount_in.saturating_sub(order.fee_rate.mul_ceil(amount_in))
                 } else {
                     // Sell: fee on TAO output — full alpha enters the pool; the fee is
                     // deducted from the TAO payout later in `distribute_tao_pro_rata`.
@@ -969,7 +972,7 @@ pub mod pallet {
 
             for e in buys.iter() {
                 let share: u64 = if total_buy_net > 0 {
-                    (total_alpha.saturating_mul(e.net as u128) / total_buy_net) as u64
+                    total_alpha.saturating_mul(e.net as u128).checked_div(total_buy_net).unwrap_or(0) as u64
                 } else {
                     0
                 };
@@ -1027,11 +1030,11 @@ pub mod pallet {
             for e in sells.iter() {
                 let sell_tao_equiv = Self::alpha_to_tao(e.net as u128, current_price);
                 let gross_share: u64 = if total_sell_tao_equiv > 0 {
-                    (total_tao.saturating_mul(sell_tao_equiv) / total_sell_tao_equiv) as u64
+                    total_tao.saturating_mul(sell_tao_equiv).checked_div(total_sell_tao_equiv).unwrap_or(0) as u64
                 } else {
                     0u64
                 };
-                let fee = e.fee_rate * gross_share;
+                let fee = e.fee_rate.mul_ceil(gross_share);
                 let net_share = gross_share.saturating_sub(fee);
 
                 if fee > 0 {
@@ -1121,10 +1124,10 @@ pub mod pallet {
         /// Convert a TAO amount to alpha at `price` (TAO/alpha).
         /// Returns 0 when `price` is zero.
         fn tao_to_alpha(tao: u128, price: U96F32) -> u128 {
-            if price == U96F32::from_num(0u32) {
+            let Some(result) = U96F32::from_num(tao).checked_div(price) else {
                 return 0u128;
-            }
-            (U96F32::from_num(tao) / price).saturating_to_num::<u128>()
+            };
+            result.saturating_to_num::<u128>()
         }
 
         /// Convert an alpha amount to TAO at `price` (TAO/alpha).
