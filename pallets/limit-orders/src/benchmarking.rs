@@ -83,6 +83,7 @@ fn make_benchmark_orders<T: crate::Config>(
             fee_recipient,
             relayer: None,
             max_slippage: None,
+            chain_id: T::ChainId::get(),
             partial_fills_enabled: false,
         });
         orders.push(sign_order::<T>(public, &order));
@@ -114,6 +115,7 @@ mod benchmarks {
             fee_recipient: account.clone(),
             relayer: None,
             max_slippage: None,
+            chain_id: T::ChainId::get(),
             partial_fills_enabled: false,
         });
         let signed = sign_order::<T>(public, &order);
