@@ -1,0 +1,28 @@
+{
+    "nodeBinary": "../target/release/node-subtensor",
+    "wsUrl": "ws://127.0.0.1:9944",
+    "blockIntervalMs": 2000,
+    "fundAccounts": [
+        { "uri": "//Alice",   "balanceTao": 10000000 },
+        { "uri": "//Bob",     "balanceTao": 10000000 },
+        { "uri": "//Charlie", "balanceTao": 10000    }
+    ],
+    "subnets": [
+        {
+            "ownerUri":  "//Alice",
+            "hotkeyUri": "//Alice//hotkey",
+            "stakes": [
+                { "coldkeyUri": "//Alice", "taoAmount": 5000 },
+                { "coldkeyUri": "//Bob",   "taoAmount": 5000 }
+            ]
+        },
+        {
+            "ownerUri":  "//Bob",
+            "hotkeyUri": "//Bob//hotkey",
+            "stakes": [
+                { "coldkeyUri": "//Alice", "taoAmount": 5000 },
+                { "coldkeyUri": "//Bob",   "taoAmount": 5000 }
+            ]
+        }
+    ]
+}

@@ -12,7 +12,8 @@
         "fmt:fix": "biome format --write .",
         "lint": "biome lint . && tsc --noEmit",
         "lint:fix": "biome lint --write .",
-        "generate-types": "polkadot-api add subtensor --wsUrl ws://localhost:9944 --skip-codegen && polkadot-api"
+        "generate-types": "polkadot-api add subtensor --wsUrl ws://localhost:9944 --skip-codegen && polkadot-api",
+        "setup-dev": "tsx scripts/setup-dev.ts"
     },
     "keywords": [],
     "author": "",
