@@ -2866,3 +2866,702 @@ fn adjust_protocol_liquidity_uses_and_sets_scrap_reservoirs() {
         );
     });
 }
+
+// --- sim_swap_pure parity tests ---
+
+/// Buy direction (Tao→Alpha): sim_swap_pure and sim_swap must return identical SwapResult.
+#[test]
+fn sim_swap_pure_buy_equals_sim_swap() {
+    use subtensor_swap_interface::SwapHandler;
+
+    new_test_ext().execute_with(|| {
+        let netuid = NetUid::from(1);
+        assert_ok!(Pallet::<Test>::maybe_initialize_v3(netuid));
+
+        let order = GetAlphaForTao::with_amount(1_000_000);
+
+        let result_sim = Pallet::<Test>::sim_swap(netuid, order.clone())
+            .expect("sim_swap (buy) must succeed");
+        let result_pure = Pallet::<Test>::sim_swap_pure(netuid, order)
+            .expect("sim_swap_pure (buy) must succeed");
+
+        assert_eq!(
+            result_sim.amount_paid_in, result_pure.amount_paid_in,
+            "amount_paid_in must match for buy"
+        );
+        assert_eq!(
+            result_sim.amount_paid_out, result_pure.amount_paid_out,
+            "amount_paid_out must match for buy"
+        );
+        assert_eq!(
+            result_sim.fee_paid, result_pure.fee_paid,
+            "fee_paid must match for buy"
+        );
+        assert_eq!(
+            result_sim.fee_to_block_author, result_pure.fee_to_block_author,
+            "fee_to_block_author must match for buy"
+        );
+    });
+}
+
+/// Sell direction (Alpha→Tao): sim_swap_pure and sim_swap must return identical SwapResult.
+#[test]
+fn sim_swap_pure_sell_equals_sim_swap() {
+    use subtensor_swap_interface::SwapHandler;
+
+    new_test_ext().execute_with(|| {
+        let netuid = NetUid::from(1);
+        assert_ok!(Pallet::<Test>::maybe_initialize_v3(netuid));
+
+        let order = GetTaoForAlpha::with_amount(4_000_000);
+
+        let result_sim = Pallet::<Test>::sim_swap(netuid, order.clone())
+            .expect("sim_swap (sell) must succeed");
+        let result_pure = Pallet::<Test>::sim_swap_pure(netuid, order)
+            .expect("sim_swap_pure (sell) must succeed");
+
+        assert_eq!(
+            result_sim.amount_paid_in, result_pure.amount_paid_in,
+            "amount_paid_in must match for sell"
+        );
+        assert_eq!(
+            result_sim.amount_paid_out, result_pure.amount_paid_out,
+            "amount_paid_out must match for sell"
+        );
+        assert_eq!(
+            result_sim.fee_paid, result_pure.fee_paid,
+            "fee_paid must match for sell"
+        );
+        assert_eq!(
+            result_sim.fee_to_block_author, result_pure.fee_to_block_author,
+            "fee_to_block_author must match for sell"
+        );
+    });
+}
+
+/// Key property: sim_swap_pure must never mutate AlphaSqrtPrice, CurrentTick, or CurrentLiquidity.
+#[test]
+fn sim_swap_pure_buy_no_storage_mutation() {
+    use subtensor_swap_interface::SwapHandler;
+
+    new_test_ext().execute_with(|| {
+        let netuid = NetUid::from(1);
+        assert_ok!(Pallet::<Test>::maybe_initialize_v3(netuid));
+
+        // Snapshot storage state before the call.
+        let sqrt_price_before = AlphaSqrtPrice::<Test>::get(netuid);
+        let current_tick_before = CurrentTick::<Test>::get(netuid);
+        let current_liquidity_before = CurrentLiquidity::<Test>::get(netuid);
+
+        let order = GetAlphaForTao::with_amount(500_000_000);
+        Pallet::<Test>::sim_swap_pure(netuid, order)
+            .expect("sim_swap_pure must succeed");
+
+        // Storage must be identical after the pure simulation.
+        assert_eq!(
+            AlphaSqrtPrice::<Test>::get(netuid),
+            sqrt_price_before,
+            "AlphaSqrtPrice must not be modified by sim_swap_pure"
+        );
+        assert_eq!(
+            CurrentTick::<Test>::get(netuid),
+            current_tick_before,
+            "CurrentTick must not be modified by sim_swap_pure"
+        );
+        assert_eq!(
+            CurrentLiquidity::<Test>::get(netuid),
+            current_liquidity_before,
+            "CurrentLiquidity must not be modified by sim_swap_pure"
+        );
+    });
+}
+
+/// Multi-tick: large enough swap to stress the full tick range; both functions must agree.
+/// Adds extra liquidity positions across several price ranges so tick crossings occur,
+/// then uses a large swap amount that exhausts multiple tick bands.
+#[test]
+fn sim_swap_pure_multi_tick_buy_equals_sim_swap() {
+    use subtensor_swap_interface::SwapHandler;
+
+    new_test_ext().execute_with(|| {
+        let netuid = NetUid::from(1);
+        assert_ok!(Pallet::<Test>::maybe_initialize_v3(netuid));
+
+        let current_price = Pallet::<Test>::current_price(netuid).to_num::<f64>();
+
+        // Add a cluster of tightly spaced liquidity positions so the large swap
+        // must cross several tick boundaries.
+        let offsets: &[f64] = &[-0.05, -0.02, 0.0, 0.02, 0.05];
+        for &offset in offsets {
+            let price_low = (current_price + offset).max(0.0001);
+            let price_high = price_low + 0.02;
+            let tick_low = price_to_tick(price_low);
+            let tick_high = price_to_tick(price_high);
+            if tick_low >= tick_high {
+                continue;
+            }
+            let _ = Pallet::<Test>::do_add_liquidity(
+                netuid,
+                &OK_COLDKEY_ACCOUNT_ID,
+                &OK_HOTKEY_ACCOUNT_ID,
+                tick_low,
+                tick_high,
+                100_000_000_000_u64,
+            );
+        }
+
+        // A swap large enough to cross multiple tick boundaries.
+        let large_amount = 2_000_000_000_u64;
+        let order = GetAlphaForTao::with_amount(large_amount);
+
+        let result_sim = Pallet::<Test>::sim_swap(netuid, order.clone())
+            .expect("sim_swap (multi-tick buy) must succeed");
+        let result_pure = Pallet::<Test>::sim_swap_pure(netuid, order)
+            .expect("sim_swap_pure (multi-tick buy) must succeed");
+
+        assert_eq!(
+            result_sim.amount_paid_in, result_pure.amount_paid_in,
+            "amount_paid_in must match for multi-tick buy"
+        );
+        assert_eq!(
+            result_sim.amount_paid_out, result_pure.amount_paid_out,
+            "amount_paid_out must match for multi-tick buy"
+        );
+        assert_eq!(
+            result_sim.fee_paid, result_pure.fee_paid,
+            "fee_paid must match for multi-tick buy"
+        );
+        assert_eq!(
+            result_sim.fee_to_block_author, result_pure.fee_to_block_author,
+            "fee_to_block_author must match for multi-tick buy"
+        );
+    });
+}
+
+/// Non-V3 subnet: both functions must return the same pass-through SwapResult
+/// (mechanism != 1 takes the fallback path that echoes the input amount).
+#[test]
+fn sim_swap_pure_non_v3_subnet_equals_sim_swap() {
+    use subtensor_swap_interface::SwapHandler;
+
+    new_test_ext().execute_with(|| {
+        // NetUid 0 has mechanism 0 in the mock (non-V3).
+        let netuid = NetUid::from(0);
+
+        let order = GetAlphaForTao::with_amount(1_234_567);
+
+        let result_sim = Pallet::<Test>::sim_swap(netuid, order.clone())
+            .expect("sim_swap (non-V3) must succeed");
+        let result_pure = Pallet::<Test>::sim_swap_pure(netuid, order)
+            .expect("sim_swap_pure (non-V3) must succeed");
+
+        assert_eq!(
+            result_sim.amount_paid_in, result_pure.amount_paid_in,
+            "amount_paid_in must match for non-V3 subnet"
+        );
+        assert_eq!(
+            result_sim.amount_paid_out, result_pure.amount_paid_out,
+            "amount_paid_out must match for non-V3 subnet"
+        );
+        assert_eq!(
+            result_sim.fee_paid, result_pure.fee_paid,
+            "fee_paid must match for non-V3 subnet"
+        );
+        assert_eq!(
+            result_sim.fee_to_block_author, result_pure.fee_to_block_author,
+            "fee_to_block_author must match for non-V3 subnet"
+        );
+    });
+}
+
+/// Minimum non-zero buy amount (1 TAO unit): both functions must agree on rounding behavior.
+#[test]
+fn sim_swap_pure_min_amount_buy() {
+    use subtensor_swap_interface::SwapHandler;
+
+    new_test_ext().execute_with(|| {
+        let netuid = NetUid::from(1);
+        assert_ok!(Pallet::<Test>::maybe_initialize_v3(netuid));
+
+        let order = GetAlphaForTao::with_amount(1);
+
+        let result_sim = Pallet::<Test>::sim_swap(netuid, order.clone())
+            .expect("sim_swap (min buy) must succeed");
+        let result_pure = Pallet::<Test>::sim_swap_pure(netuid, order)
+            .expect("sim_swap_pure (min buy) must succeed");
+
+        assert_eq!(
+            result_sim.amount_paid_in, result_pure.amount_paid_in,
+            "amount_paid_in must match for min buy amount"
+        );
+        assert_eq!(
+            result_sim.amount_paid_out, result_pure.amount_paid_out,
+            "amount_paid_out must match for min buy amount"
+        );
+        assert_eq!(
+            result_sim.fee_paid, result_pure.fee_paid,
+            "fee_paid must match for min buy amount"
+        );
+        assert_eq!(
+            result_sim.fee_to_block_author, result_pure.fee_to_block_author,
+            "fee_to_block_author must match for min buy amount"
+        );
+    });
+}
+
+/// Minimum non-zero sell amount (1 Alpha unit): both functions must agree on rounding behavior.
+#[test]
+fn sim_swap_pure_min_amount_sell() {
+    use subtensor_swap_interface::SwapHandler;
+
+    new_test_ext().execute_with(|| {
+        let netuid = NetUid::from(1);
+        assert_ok!(Pallet::<Test>::maybe_initialize_v3(netuid));
+
+        let order = GetTaoForAlpha::with_amount(1);
+
+        let result_sim = Pallet::<Test>::sim_swap(netuid, order.clone())
+            .expect("sim_swap (min sell) must succeed");
+        let result_pure = Pallet::<Test>::sim_swap_pure(netuid, order)
+            .expect("sim_swap_pure (min sell) must succeed");
+
+        assert_eq!(
+            result_sim.amount_paid_in, result_pure.amount_paid_in,
+            "amount_paid_in must match for min sell amount"
+        );
+        assert_eq!(
+            result_sim.amount_paid_out, result_pure.amount_paid_out,
+            "amount_paid_out must match for min sell amount"
+        );
+        assert_eq!(
+            result_sim.fee_paid, result_pure.fee_paid,
+            "fee_paid must match for min sell amount"
+        );
+        assert_eq!(
+            result_sim.fee_to_block_author, result_pure.fee_to_block_author,
+            "fee_to_block_author must match for min sell amount"
+        );
+    });
+}
+
+/// Key property: sim_swap_pure must never mutate AlphaSqrtPrice, CurrentTick, or CurrentLiquidity
+/// when called in the sell (Alpha→Tao) direction.
+#[test]
+fn sim_swap_pure_sell_no_storage_mutation() {
+    use subtensor_swap_interface::SwapHandler;
+
+    new_test_ext().execute_with(|| {
+        let netuid = NetUid::from(1);
+        assert_ok!(Pallet::<Test>::maybe_initialize_v3(netuid));
+
+        // Snapshot storage state before the call.
+        let sqrt_price_before = AlphaSqrtPrice::<Test>::get(netuid);
+        let current_tick_before = CurrentTick::<Test>::get(netuid);
+        let current_liquidity_before = CurrentLiquidity::<Test>::get(netuid);
+
+        let order = GetTaoForAlpha::with_amount(500_000_000);
+        Pallet::<Test>::sim_swap_pure(netuid, order)
+            .expect("sim_swap_pure (sell) must succeed");
+
+        // Storage must be identical after the pure simulation.
+        assert_eq!(
+            AlphaSqrtPrice::<Test>::get(netuid),
+            sqrt_price_before,
+            "AlphaSqrtPrice must not be modified by sim_swap_pure (sell)"
+        );
+        assert_eq!(
+            CurrentTick::<Test>::get(netuid),
+            current_tick_before,
+            "CurrentTick must not be modified by sim_swap_pure (sell)"
+        );
+        assert_eq!(
+            CurrentLiquidity::<Test>::get(netuid),
+            current_liquidity_before,
+            "CurrentLiquidity must not be modified by sim_swap_pure (sell)"
+        );
+    });
+}
+
+/// Fee accumulators must not be written by sim_swap_pure.
+/// Snapshot FeeGlobalTao and FeeGlobalAlpha before the call and assert both are unchanged after.
+#[test]
+fn sim_swap_pure_fee_globals_not_mutated() {
+    use subtensor_swap_interface::SwapHandler;
+
+    new_test_ext().execute_with(|| {
+        let netuid = NetUid::from(1);
+        assert_ok!(Pallet::<Test>::maybe_initialize_v3(netuid));
+
+        // Snapshot fee globals before the pure simulation.
+        let fee_global_tao_before = FeeGlobalTao::<Test>::get(netuid);
+        let fee_global_alpha_before = FeeGlobalAlpha::<Test>::get(netuid);
+
+        let order = GetAlphaForTao::with_amount(1_000_000);
+        Pallet::<Test>::sim_swap_pure(netuid, order)
+            .expect("sim_swap_pure (fee globals) must succeed");
+
+        assert_eq!(
+            FeeGlobalTao::<Test>::get(netuid),
+            fee_global_tao_before,
+            "FeeGlobalTao must not be modified by sim_swap_pure"
+        );
+        assert_eq!(
+            FeeGlobalAlpha::<Test>::get(netuid),
+            fee_global_alpha_before,
+            "FeeGlobalAlpha must not be modified by sim_swap_pure"
+        );
+    });
+}
+
+/// At maximum fee rate both sim functions must still agree for buy and sell orders.
+#[test]
+fn sim_swap_pure_high_fee_rate_equals_sim_swap() {
+    use subtensor_swap_interface::SwapHandler;
+
+    new_test_ext().execute_with(|| {
+        let netuid = NetUid::from(1);
+        assert_ok!(Pallet::<Test>::maybe_initialize_v3(netuid));
+
+        // Set fee rate to the maximum allowed value.
+        FeeRate::<Test>::insert(netuid, MaxFeeRate::get());
+
+        // --- Buy direction ---
+        let buy_order = GetAlphaForTao::with_amount(1_000_000);
+        let result_sim_buy = Pallet::<Test>::sim_swap(netuid, buy_order.clone())
+            .expect("sim_swap (high-fee buy) must succeed");
+        let result_pure_buy = Pallet::<Test>::sim_swap_pure(netuid, buy_order)
+            .expect("sim_swap_pure (high-fee buy) must succeed");
+
+        assert_eq!(
+            result_sim_buy.amount_paid_in, result_pure_buy.amount_paid_in,
+            "amount_paid_in must match for high-fee buy"
+        );
+        assert_eq!(
+            result_sim_buy.amount_paid_out, result_pure_buy.amount_paid_out,
+            "amount_paid_out must match for high-fee buy"
+        );
+        assert_eq!(
+            result_sim_buy.fee_paid, result_pure_buy.fee_paid,
+            "fee_paid must match for high-fee buy"
+        );
+        assert_eq!(
+            result_sim_buy.fee_to_block_author, result_pure_buy.fee_to_block_author,
+            "fee_to_block_author must match for high-fee buy"
+        );
+
+        // --- Sell direction ---
+        let sell_order = GetTaoForAlpha::with_amount(4_000_000);
+        let result_sim_sell = Pallet::<Test>::sim_swap(netuid, sell_order.clone())
+            .expect("sim_swap (high-fee sell) must succeed");
+        let result_pure_sell = Pallet::<Test>::sim_swap_pure(netuid, sell_order)
+            .expect("sim_swap_pure (high-fee sell) must succeed");
+
+        assert_eq!(
+            result_sim_sell.amount_paid_in, result_pure_sell.amount_paid_in,
+            "amount_paid_in must match for high-fee sell"
+        );
+        assert_eq!(
+            result_sim_sell.amount_paid_out, result_pure_sell.amount_paid_out,
+            "amount_paid_out must match for high-fee sell"
+        );
+        assert_eq!(
+            result_sim_sell.fee_paid, result_pure_sell.fee_paid,
+            "fee_paid must match for high-fee sell"
+        );
+        assert_eq!(
+            result_sim_sell.fee_to_block_author, result_pure_sell.fee_to_block_author,
+            "fee_to_block_author must match for high-fee sell"
+        );
+    });
+}
+
+/// After a real swap that moves the pool state, both sim functions must still agree
+/// when querying the updated pool.
+#[test]
+fn sim_swap_pure_after_real_swap_equals_sim_swap() {
+    use subtensor_swap_interface::SwapHandler;
+
+    new_test_ext().execute_with(|| {
+        let netuid = NetUid::from(1);
+        assert_ok!(Pallet::<Test>::maybe_initialize_v3(netuid));
+
+        // Perform a real swap to move the pool to a different price state.
+        let real_order = GetAlphaForTao::with_amount(50_000_000);
+        let limit_sqrt_price = SqrtPrice::from_num(
+            (Pallet::<Test>::current_price(netuid).to_num::<f64>() * 10.0_f64).sqrt(),
+        );
+        assert_ok!(Pallet::<Test>::do_swap(
+            netuid,
+            real_order,
+            limit_sqrt_price,
+            false,
+            false
+        ));
+
+        // Now both sim functions must agree on the post-swap state.
+        let order = GetAlphaForTao::with_amount(1_000_000);
+        let result_sim = Pallet::<Test>::sim_swap(netuid, order.clone())
+            .expect("sim_swap (post-real-swap) must succeed");
+        let result_pure = Pallet::<Test>::sim_swap_pure(netuid, order)
+            .expect("sim_swap_pure (post-real-swap) must succeed");
+
+        assert_eq!(
+            result_sim.amount_paid_in, result_pure.amount_paid_in,
+            "amount_paid_in must match after real swap"
+        );
+        assert_eq!(
+            result_sim.amount_paid_out, result_pure.amount_paid_out,
+            "amount_paid_out must match after real swap"
+        );
+        assert_eq!(
+            result_sim.fee_paid, result_pure.fee_paid,
+            "fee_paid must match after real swap"
+        );
+        assert_eq!(
+            result_sim.fee_to_block_author, result_pure.fee_to_block_author,
+            "fee_to_block_author must match after real swap"
+        );
+    });
+}
+
+/// Multi-tick sell: large enough sell order to cross multiple tick boundaries;
+/// both functions must agree on all SwapResult fields.
+#[test]
+fn sim_swap_pure_multi_tick_sell_equals_sim_swap() {
+    use subtensor_swap_interface::SwapHandler;
+
+    new_test_ext().execute_with(|| {
+        let netuid = NetUid::from(1);
+        assert_ok!(Pallet::<Test>::maybe_initialize_v3(netuid));
+
+        let current_price = Pallet::<Test>::current_price(netuid).to_num::<f64>();
+
+        // Add a cluster of tightly spaced liquidity positions so the large sell swap
+        // must cross several tick boundaries.
+        let offsets: &[f64] = &[-0.05, -0.02, 0.0, 0.02, 0.05];
+        for &offset in offsets {
+            let price_low = (current_price + offset).max(0.0001);
+            let price_high = price_low + 0.02;
+            let tick_low = price_to_tick(price_low);
+            let tick_high = price_to_tick(price_high);
+            if tick_low >= tick_high {
+                continue;
+            }
+            let _ = Pallet::<Test>::do_add_liquidity(
+                netuid,
+                &OK_COLDKEY_ACCOUNT_ID,
+                &OK_HOTKEY_ACCOUNT_ID,
+                tick_low,
+                tick_high,
+                100_000_000_000_u64,
+            );
+        }
+
+        // A sell large enough to cross multiple tick boundaries.
+        let large_amount = 8_000_000_000_u64;
+        let order = GetTaoForAlpha::with_amount(large_amount);
+
+        let result_sim = Pallet::<Test>::sim_swap(netuid, order.clone())
+            .expect("sim_swap (multi-tick sell) must succeed");
+        let result_pure = Pallet::<Test>::sim_swap_pure(netuid, order)
+            .expect("sim_swap_pure (multi-tick sell) must succeed");
+
+        assert_eq!(
+            result_sim.amount_paid_in, result_pure.amount_paid_in,
+            "amount_paid_in must match for multi-tick sell"
+        );
+        assert_eq!(
+            result_sim.amount_paid_out, result_pure.amount_paid_out,
+            "amount_paid_out must match for multi-tick sell"
+        );
+        assert_eq!(
+            result_sim.fee_paid, result_pure.fee_paid,
+            "fee_paid must match for multi-tick sell"
+        );
+        assert_eq!(
+            result_sim.fee_to_block_author, result_pure.fee_to_block_author,
+            "fee_to_block_author must match for multi-tick sell"
+        );
+    });
+}
+
+/// On an uninitialized pool (SwapV3Initialized is false) both sim functions must behave
+/// identically — either both return an error or both return the same Ok result.
+#[test]
+fn sim_swap_pure_uninitialized_pool_equals_sim_swap() {
+    use subtensor_swap_interface::SwapHandler;
+
+    new_test_ext().execute_with(|| {
+        // Use a netuid that has never been initialized.
+        let netuid = NetUid::from(50);
+
+        // Confirm the pool is indeed uninitialized at the start.
+        assert!(
+            !SwapV3Initialized::<Test>::get(netuid),
+            "pool must be uninitialized for this test"
+        );
+
+        let order = GetAlphaForTao::with_amount(1_000_000);
+
+        let result_sim = Pallet::<Test>::sim_swap(netuid, order.clone());
+        let result_pure = Pallet::<Test>::sim_swap_pure(netuid, order);
+
+        match (result_sim, result_pure) {
+            (Ok(sim), Ok(pure)) => {
+                assert_eq!(
+                    sim.amount_paid_in, pure.amount_paid_in,
+                    "amount_paid_in must match for uninitialized pool"
+                );
+                assert_eq!(
+                    sim.amount_paid_out, pure.amount_paid_out,
+                    "amount_paid_out must match for uninitialized pool"
+                );
+                assert_eq!(
+                    sim.fee_paid, pure.fee_paid,
+                    "fee_paid must match for uninitialized pool"
+                );
+                assert_eq!(
+                    sim.fee_to_block_author, pure.fee_to_block_author,
+                    "fee_to_block_author must match for uninitialized pool"
+                );
+            }
+            (Err(sim_err), Err(pure_err)) => {
+                assert_eq!(
+                    sim_err, pure_err,
+                    "both functions must return the same error for uninitialized pool"
+                );
+            }
+            (Ok(_), Err(_)) => {
+                panic!("sim_swap succeeded but sim_swap_pure failed on uninitialized pool");
+            }
+            (Err(_), Ok(_)) => {
+                panic!("sim_swap failed but sim_swap_pure succeeded on uninitialized pool");
+            }
+        }
+    });
+}
+
+/// Both sim functions must behave identically when the subnet does not exist.
+#[test]
+fn sim_swap_pure_non_existent_subnet_equals_sim_swap() {
+    use subtensor_swap_interface::SwapHandler;
+
+    new_test_ext().execute_with(|| {
+        let netuid = NetUid::from(NON_EXISTENT_NETUID);
+
+        let order = GetAlphaForTao::with_amount(1_000_000);
+
+        let result_sim = Pallet::<Test>::sim_swap(netuid, order.clone());
+        let result_pure = Pallet::<Test>::sim_swap_pure(netuid, order);
+
+        match (result_sim, result_pure) {
+            (Ok(sim), Ok(pure)) => {
+                assert_eq!(
+                    sim.amount_paid_in, pure.amount_paid_in,
+                    "amount_paid_in must match for non-existent subnet"
+                );
+                assert_eq!(
+                    sim.amount_paid_out, pure.amount_paid_out,
+                    "amount_paid_out must match for non-existent subnet"
+                );
+                assert_eq!(
+                    sim.fee_paid, pure.fee_paid,
+                    "fee_paid must match for non-existent subnet"
+                );
+                assert_eq!(
+                    sim.fee_to_block_author, pure.fee_to_block_author,
+                    "fee_to_block_author must match for non-existent subnet"
+                );
+            }
+            (Err(sim_err), Err(pure_err)) => {
+                assert_eq!(
+                    sim_err, pure_err,
+                    "both functions must return the same error for non-existent subnet"
+                );
+            }
+            (Ok(_), Err(_)) => {
+                panic!("sim_swap succeeded but sim_swap_pure failed for non-existent subnet");
+            }
+            (Err(_), Ok(_)) => {
+                panic!("sim_swap failed but sim_swap_pure succeeded for non-existent subnet");
+            }
+        }
+    });
+}
+
+/// Calling sim_swap_pure three times in a row must produce identical results each time,
+/// and those results must match a single call to sim_swap. This verifies the absence of
+/// side effects across multiple pure calls.
+#[test]
+fn sim_swap_pure_repeated_calls_are_idempotent() {
+    use subtensor_swap_interface::SwapHandler;
+
+    new_test_ext().execute_with(|| {
+        let netuid = NetUid::from(1);
+        assert_ok!(Pallet::<Test>::maybe_initialize_v3(netuid));
+
+        let order = GetAlphaForTao::with_amount(2_000_000);
+
+        let result_sim = Pallet::<Test>::sim_swap(netuid, order.clone())
+            .expect("sim_swap must succeed");
+
+        let result_pure_1 = Pallet::<Test>::sim_swap_pure(netuid, order.clone())
+            .expect("sim_swap_pure call 1 must succeed");
+        let result_pure_2 = Pallet::<Test>::sim_swap_pure(netuid, order.clone())
+            .expect("sim_swap_pure call 2 must succeed");
+        let result_pure_3 = Pallet::<Test>::sim_swap_pure(netuid, order)
+            .expect("sim_swap_pure call 3 must succeed");
+
+        // All three pure calls must agree with each other.
+        assert_eq!(
+            result_pure_1.amount_paid_in, result_pure_2.amount_paid_in,
+            "amount_paid_in must be identical across repeated pure calls (1 vs 2)"
+        );
+        assert_eq!(
+            result_pure_2.amount_paid_in, result_pure_3.amount_paid_in,
+            "amount_paid_in must be identical across repeated pure calls (2 vs 3)"
+        );
+        assert_eq!(
+            result_pure_1.amount_paid_out, result_pure_2.amount_paid_out,
+            "amount_paid_out must be identical across repeated pure calls (1 vs 2)"
+        );
+        assert_eq!(
+            result_pure_2.amount_paid_out, result_pure_3.amount_paid_out,
+            "amount_paid_out must be identical across repeated pure calls (2 vs 3)"
+        );
+        assert_eq!(
+            result_pure_1.fee_paid, result_pure_2.fee_paid,
+            "fee_paid must be identical across repeated pure calls (1 vs 2)"
+        );
+        assert_eq!(
+            result_pure_2.fee_paid, result_pure_3.fee_paid,
+            "fee_paid must be identical across repeated pure calls (2 vs 3)"
+        );
+        assert_eq!(
+            result_pure_1.fee_to_block_author, result_pure_2.fee_to_block_author,
+            "fee_to_block_author must be identical across repeated pure calls (1 vs 2)"
+        );
+        assert_eq!(
+            result_pure_2.fee_to_block_author, result_pure_3.fee_to_block_author,
+            "fee_to_block_author must be identical across repeated pure calls (2 vs 3)"
+        );
+
+        // All pure calls must also agree with sim_swap.
+        assert_eq!(
+            result_sim.amount_paid_in, result_pure_1.amount_paid_in,
+            "amount_paid_in must match sim_swap for idempotent pure call"
+        );
+        assert_eq!(
+            result_sim.amount_paid_out, result_pure_1.amount_paid_out,
+            "amount_paid_out must match sim_swap for idempotent pure call"
+        );
+        assert_eq!(
+            result_sim.fee_paid, result_pure_1.fee_paid,
+            "fee_paid must match sim_swap for idempotent pure call"
+        );
+        assert_eq!(
+            result_sim.fee_to_block_author, result_pure_1.fee_to_block_author,
+            "fee_to_block_author must match sim_swap for idempotent pure call"
+        );
+    });
+}
