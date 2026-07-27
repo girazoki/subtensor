@@ -60,12 +60,20 @@ pub enum CallRef {
     Specific(Ident, Ident),
 }
 
+/// Operator used in a conditional call rule.
+pub enum ConditionalOp {
+    /// (field) < LIMIT
+    LessThan { field: Ident, limit: Expr },
+    /// (field_a) == (field_b)  — two call params must be equal
+    FieldsEqual { field_a: Ident, field_b: Ident },
+}
+
 /// Conditional call: `Pallet::call where (field) < LIMIT`
+///                or `Pallet::call where (field_a) == (field_b)`
 pub struct ConditionalCallRef {
     pub pallet: Ident,
     pub call: Ident,
-    pub field: Ident,
-    pub limit: Expr,
+    pub op: ConditionalOp,
 }
 
 /// Nested call: `Pallet::call where nested(field) == TargetPallet::target_call`
@@ -219,19 +227,28 @@ fn parse_conditional_calls(input: ParseStream) -> Result<Vec<ConditionalCallRef>
         let pallet: Ident = input.parse()?;
         input.parse::<Token![::]>()?;
         let call: Ident = input.parse()?;
-        // parse: where (field) < LIMIT
+        // parse: where (field) < LIMIT  OR  where (field_a) == (field_b)
         input.parse::<Token![where]>()?;
         let field_content;
         syn::parenthesized!(field_content in input);
         let field: Ident = field_content.parse()?;
-        input.parse::<Token![<]>()?;
-        let limit: Expr = input.parse()?;
-        calls.push(ConditionalCallRef {
-            pallet,
-            call,
-            field,
-            limit,
-        });
+        let op = if input.peek(Token![<]) {
+            input.parse::<Token![<]>()?;
+            let limit: Expr = input.parse()?;
+            ConditionalOp::LessThan { field, limit }
+        } else if input.peek(Token![==]) {
+            input.parse::<Token![==]>()?;
+            let field_b_content;
+            syn::parenthesized!(field_b_content in input);
+            let field_b: Ident = field_b_content.parse()?;
+            ConditionalOp::FieldsEqual {
+                field_a: field,
+                field_b,
+            }
+        } else {
+            return Err(input.error("expected `<` or `==`"));
+        };
+        calls.push(ConditionalCallRef { pallet, call, op });
         if input.peek(Token![,]) {
             input.parse::<Token![,]>()?;
         }
@@ -332,12 +349,17 @@ impl ProxyFilterInput {
                         let variant = &pallet_def.runtime_variant;
                         let module = &pallet_def.module;
                         let call_name = &cond.call;
-                        let field = &cond.field;
-                        let limit = &cond.limit;
-                        quote! {
-                            RuntimeCall::#variant(#module::Call::#call_name { #field, .. }) => {
-                                *#field < #limit
-                            }
+                        match &cond.op {
+                            ConditionalOp::LessThan { field, limit } => quote! {
+                                RuntimeCall::#variant(#module::Call::#call_name { #field, .. }) => {
+                                    *#field < #limit
+                                }
+                            },
+                            ConditionalOp::FieldsEqual { field_a, field_b } => quote! {
+                                RuntimeCall::#variant(#module::Call::#call_name { #field_a, #field_b, .. }) => {
+                                    *#field_a == *#field_b
+                                }
+                            },
                         }
                     });
                     quote! {
@@ -500,15 +522,31 @@ impl ProxyFilterInput {
                 let runtime_variant = &pallet_def.runtime_variant;
                 let module = &pallet_def.module;
                 let call_str = cond.call.to_string();
-                let field_str = cond.field.to_string();
-                let limit = &cond.limit;
+                let condition = match &cond.op {
+                    ConditionalOp::LessThan { field, limit } => {
+                        let field_str = field.to_string();
+                        quote! {
+                            CallCondition::ParamLessThan {
+                                param_name: #field_str.as_bytes().to_vec(),
+                                limit: Into::<u64>::into(#limit) as u128,
+                            }
+                        }
+                    }
+                    ConditionalOp::FieldsEqual { field_a, field_b } => {
+                        let field_a_str = field_a.to_string();
+                        let field_b_str = field_b.to_string();
+                        quote! {
+                            CallCondition::ParamsEqual {
+                                param_a: #field_a_str.as_bytes().to_vec(),
+                                param_b: #field_b_str.as_bytes().to_vec(),
+                            }
+                        }
+                    }
+                };
                 quote! {
                     call_info_by_name_conditional::<#runtime_variant, #module::Call<Runtime>>(
                         #call_str,
-                        CallCondition::ParamLessThan {
-                            param_name: #field_str.as_bytes().to_vec(),
-                            limit: Into::<u64>::into(#limit) as u128,
-                        },
+                        #condition,
                     )
                 }
             })

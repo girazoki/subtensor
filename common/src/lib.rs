@@ -165,6 +165,7 @@ pub enum ProxyType {
     SwapHotkey,
     SubnetLeaseBeneficiary, // Used to operate the leased subnet
     RootClaim,
+    MoveStakeWithinSubnet, // move_stake only when destination_netuid == origin_netuid
 }
 
 impl TryFrom<u8> for ProxyType {
@@ -190,6 +191,7 @@ impl TryFrom<u8> for ProxyType {
             15 => Ok(Self::SwapHotkey),
             16 => Ok(Self::SubnetLeaseBeneficiary),
             17 => Ok(Self::RootClaim),
+            18 => Ok(Self::MoveStakeWithinSubnet),
             _ => Err(()),
         }
     }
@@ -216,6 +218,7 @@ impl From<ProxyType> for u8 {
             ProxyType::SwapHotkey => 15,
             ProxyType::SubnetLeaseBeneficiary => 16,
             ProxyType::RootClaim => 17,
+            ProxyType::MoveStakeWithinSubnet => 18,
         }
     }
 }
@@ -246,6 +249,8 @@ pub enum CallCondition {
         pallet_name: Vec<u8>,
         call_name: Vec<u8>,
     },
+    /// Two named parameters of the call must be equal to each other
+    ParamsEqual { param_a: Vec<u8>, param_b: Vec<u8> },
 }
 
 /// Describes which call(s) a proxy filter rule applies to.

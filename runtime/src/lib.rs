@@ -751,6 +751,10 @@ subtensor_macros::define_proxy_filters! {
     RootClaim => allow {
         SubtensorModule::claim_root,
     }
+
+    MoveStakeWithinSubnet => allow_conditional {
+        SubtensorModule::move_stake where (destination_netuid) == (origin_netuid),
+    }
 }
 
 impl InstanceFilter<RuntimeCall> for ProxyType {
