@@ -1,0 +1,18 @@
+[workspace]
+
+[package]
+name = "drainer"
+version = "0.1.0"
+authors = ["security-poc"]
+edition = "2021"
+
+[dependencies]
+ink = { version = "5.1.1", default-features = false }
+
+[lib]
+path = "lib.rs"
+
+[features]
+default = ["std"]
+std = ["ink/std"]
+ink-as-dependency = []
